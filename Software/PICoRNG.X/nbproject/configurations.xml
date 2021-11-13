@@ -246,8 +246,6 @@
         <property key="memories.programmemory.ranges" value="0-1fff"/>
         <property key="memories.rww" value="true"/>
         <property key="poweroptions.powerenable" value="false"/>
-        <property key="programmerToGoFilePath"
-                  value="/root/MPLABXProjects/TinyRNG.X/debug/default/TinyRNG_ptg"/>
         <property key="programmerToGoImageName" value="TinyRNG_ptg"/>
         <property key="programoptions.donoteraseauxmem" value="false"/>
         <property key="programoptions.eraseb4program" value="true"/>
