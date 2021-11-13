@@ -1,0 +1,324 @@
+// DOM-IGNORE-BEGIN
+/*******************************************************************************
+Copyright 2015 Microchip Technology Inc. (www.microchip.com)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+To request to license the code under the MLA license (www.microchip.com/mla_license), 
+please contact mla_licensing@microchip.com
+ *******************************************************************************/
+//DOM-IGNORE-END
+
+/********************************************************************
+ Change History:
+  Rev    Description
+  ----   -----------
+  2.3    Deprecated the mUSBUSARTIsTxTrfReady() macro.  It is 
+         replaced by the USBUSARTIsTxTrfReady() function.
+
+  2.6    Minor definition changes
+
+  2.6a   No Changes
+
+  2.7    Fixed error in the part support list of the variables section
+         where the address of the CDC variables are defined.  The 
+         PIC18F2553 was incorrectly named PIC18F2453 and the PIC18F4558
+         was incorrectly named PIC18F4458.
+
+         http://www.microchip.com/forums/fb.aspx?m=487397
+
+  2.8    Minor change to CDCInitEP() to enhance ruggedness in
+         multi0-threaded usage scenarios.
+  
+  2.9b   Updated to implement optional support for DTS reporting.
+
+ ********************************************************************/
+
+/** I N C L U D E S **********************************************************/
+#include "usb.h"
+#include "usb_device_cdc.h"
+
+#ifdef USB_USE_CDC
+
+#ifndef FIXED_ADDRESS_MEMORY
+#define IN_DATA_BUFFER_ADDRESS_TAG
+#define OUT_DATA_BUFFER_ADDRESS_TAG
+#define CONTROL_BUFFER_ADDRESS_TAG
+#define DRIVER_DATA_ADDRESS_TAG
+#endif
+
+#if !defined(IN_DATA_BUFFER_ADDRESS_TAG) || !defined(OUT_DATA_BUFFER_ADDRESS_TAG) || !defined(CONTROL_BUFFER_ADDRESS_TAG) || !defined(DRIVER_DATA_ADDRESS_TAG)
+#error "One of the fixed memory address definitions is not defined.  Please define the required address tags for the required buffers."
+#endif
+
+/** V A R I A B L E S ********************************************************/
+volatile uint8_t rx_buf[2][64] IN_DATA_BUFFER_ADDRESS_TAG;
+volatile uint8_t rx_buf_len[2] = {0};
+volatile uint8_t rx_buf_pos[2] = {0};
+volatile uint8_t rx_buf_idx = 0;
+volatile uint8_t rx_buf_idx_other = 0;
+
+volatile uint8_t tx_buf[2][64] OUT_DATA_BUFFER_ADDRESS_TAG;
+volatile uint8_t tx_buf_len[2] = {0};
+volatile uint8_t tx_buf_idx = 0;
+
+USB_HANDLE CDCDataTxHandle;
+USB_HANDLE CDCDataRxHandle;
+
+
+/**************************************************************************
+  SEND_ENCAPSULATED_COMMAND and GET_ENCAPSULATED_RESPONSE are required
+  requests according to the CDC specification.
+  However, it is not really being used here, therefore a dummy buffer is
+  used for conformance.
+ **************************************************************************/
+#define dummy_length    0x08
+uint8_t dummy_encapsulated_cmd_response[dummy_length];
+
+
+/** P R I V A T E  P R O T O T Y P E S ***************************************/
+void USBCDCSetLineCoding(void);
+
+/** D E C L A R A T I O N S **************************************************/
+//#pragma code
+
+/** C L A S S  S P E C I F I C  R E Q ****************************************/
+
+/******************************************************************************
+    Function:
+        void USBCheckCDCRequest(void)
+ 
+    Description:
+        This routine checks the most recently received SETUP data packet to 
+        see if the request is specific to the CDC class.  If the request was
+        a CDC specific request, this function will take care of handling the
+        request and responding appropriately.
+ 		
+    PreCondition:
+        This function should only be called after a control transfer SETUP
+        packet has arrived from the host.
+
+    Parameters:
+        None
+		
+    Return Values:
+        None
+		
+    Remarks:
+        This function does not change status or do anything if the SETUP packet
+        did not contain a CDC class specific request.		 
+ *****************************************************************************/
+void USBCheckCDCRequest(void) {
+    /*
+     * If request recipient is not an interface then return
+     */
+    if (SetupPkt.Recipient != USB_SETUP_RECIPIENT_INTERFACE_BITFIELD) return;
+
+    /*
+     * If request type is not class-specific then return
+     */
+    if (SetupPkt.RequestType != USB_SETUP_TYPE_CLASS_BITFIELD) return;
+
+    /*
+     * Interface ID must match interface numbers associated with
+     * CDC class, else return
+     */
+    if ((SetupPkt.bIntfID != CDC_COMM_INTF_ID)&&
+            (SetupPkt.bIntfID != CDC_DATA_INTF_ID)) return;
+
+    switch (SetupPkt.bRequest) {
+            //****** These commands are required ******//
+        case SEND_ENCAPSULATED_COMMAND:
+            //send the packet
+            inPipes[0].pSrc.bRam = (uint8_t*) & dummy_encapsulated_cmd_response;
+            inPipes[0].wCount.Val = dummy_length;
+            inPipes[0].info.bits.ctrl_trf_mem = USB_EP0_RAM;
+            inPipes[0].info.bits.busy = 1;
+            break;
+        case GET_ENCAPSULATED_RESPONSE:
+            // Populate dummy_encapsulated_cmd_response first.
+            inPipes[0].pSrc.bRam = (uint8_t*) & dummy_encapsulated_cmd_response;
+            inPipes[0].info.bits.busy = 1;
+            break;
+            //****** End of required commands ******//
+        default:
+            break;
+    }//end switch(SetupPkt.bRequest)
+
+}//end USBCheckCDCRequest
+
+/** U S E R  A P I ***********************************************************/
+
+/**************************************************************************
+  Function:
+        void CDCInitEP(void)
+    
+  Summary:
+    This function initializes the CDC function driver. This function should
+    be called after the SET_CONFIGURATION command (ex: within the context of
+    the USBCBInitEP() function).
+  Description:
+    This function initializes the CDC function driver. This function sets
+    the default line coding (baud rate, bit parity, number of data bits,
+    and format). This function also enables the endpoints and prepares for
+    the first transfer from the host.
+    
+    This function should be called after the SET_CONFIGURATION command.
+    This is most simply done by calling this function from the
+    USBCBInitEP() function.
+    
+    Typical Usage:
+    <code>
+        void USBCBInitEP(void)
+        {
+            CDCInitEP();
+        }
+    </code>
+  Conditions:
+    None
+  Remarks:
+    None                                                                   
+ **************************************************************************/
+void CDCInitEP(void) {
+    LATCbits.LATC2 = 1;
+
+    USBEnableEndpoint(CDC_COMM_EP, USB_IN_ENABLED | USB_HANDSHAKE_ENABLED | USB_DISALLOW_SETUP);
+    USBEnableEndpoint(CDC_DATA_EP, USB_IN_ENABLED | USB_OUT_ENABLED | USB_HANDSHAKE_ENABLED | USB_DISALLOW_SETUP);
+
+//    CDCDataRxHandle = USBRxOnePacket(CDC_DATA_EP, (uint8_t*) & rx_buf[0], 64);
+    CDCDataTxHandle = NULL;
+
+
+}//end CDCInitEP
+
+
+void CDC_RX_Callback(uint8_t idx) {
+    //    uint8_t len = rx_buf_len[idx];
+    //    volatile uint8_t *buf = rx_buf[idx];
+    //    for (uint8_t i=0; i<len; i++) {
+    //        while (TXSTAbits.TRMT == 0);
+    //        TXREG = buf[i];
+    //    }
+
+
+//    rx_buf_idx_other = idx;
+
+    //    if (uart_poll) {
+    //        uint8_t len = rx_buf_len[idx];
+    //        volatile uint8_t *buf = rx_buf[idx];
+    //        for (uint8_t i = 0; i < len; i++) {
+    //            while (TXSTAbits.TRMT == 0);
+    //            TXREG = buf[i];
+    //        }
+    //    } else {
+    //        if (rx_buf_len[idx]) {
+    //            rx_buf_idx_other = idx;
+    //            PIR1bits.TXIF = 0;
+    //            PIE1bits.TXIE = 1;
+    //        }
+    //    }
+
+}
+
+void USBDeluxeDevice_CDC_ACM_TryRx() {
+    if (!USBHandleBusy(CDCDataRxHandle)) {
+        uint8_t cur_buf_idx = rx_buf_idx;
+        uint8_t last_rx_len = USBHandleGetLength(CDCDataRxHandle);
+
+
+        rx_buf_idx = !rx_buf_idx;
+
+        CDCDataRxHandle = USBRxOnePacket(CDC_DATA_EP, rx_buf[rx_buf_idx], 64);
+
+
+        LATCbits.LATC2 = 0;
+
+        rx_buf_len[cur_buf_idx] = last_rx_len;
+        rx_buf_pos[cur_buf_idx] = 0;
+
+        CDC_RX_Callback(cur_buf_idx);
+    }
+}
+
+uint8_t is_zlp = 0;
+
+void USBDeluxeDevice_CDC_ACM_DoTx() {
+
+    USBMaskInterrupts();
+
+
+    if (!USBHandleBusy(CDCDataTxHandle)) { // Last TX completed
+        uint8_t cur_buf_idx = tx_buf_idx; // Last configured buffer index
+        uint8_t cur_buf_len = tx_buf_len[cur_buf_idx];
+
+        if (cur_buf_len) {
+            LATCbits.LATC2 = 0;
+
+            CDCDataTxHandle = USBTxOnePacket(CDC_DATA_EP, tx_buf[cur_buf_idx], cur_buf_len);
+
+            tx_buf_idx = !tx_buf_idx; // Switch to another buffer
+
+            tx_buf_len[tx_buf_idx] = 0; // Mark the 'another' buffer will be used as empty
+
+//            if (cur_buf_len == 64) {
+//                is_zlp = 1;
+//            } else {
+//                is_zlp = 0;
+//            }
+        } else {
+//            if (is_zlp) {
+//                CDCDataTxHandle = USBTxOnePacket(CDC_DATA_EP, NULL, 0);
+//                is_zlp = 0;
+//            }
+        }
+
+    }
+
+    USBUnmaskInterrupts();
+
+}
+
+void USBDeluxeDevice_CDC_ACM_Tasks() {
+    if (tx_buf_len[tx_buf_idx] == 0) {
+        for (uint8_t i=0; i<64; i++) {
+            uint8_t byte = 0;
+            
+            for (uint8_t j=0; j<8; j++) {
+                uint8_t cur_byte = (PORTCbits.RC5 << 0);
+                cur_byte |= (PORTCbits.RC5 << 1);
+                cur_byte |= (PORTCbits.RC5 << 2);
+                cur_byte |= (PORTCbits.RC5 << 3);
+                cur_byte |= (PORTCbits.RC5 << 4);
+                cur_byte |= (PORTCbits.RC5 << 5);
+                cur_byte |= (PORTCbits.RC5 << 6);
+                cur_byte |= (PORTCbits.RC5 << 7);
+                
+                byte ^= cur_byte;
+            }
+            
+            tx_buf[tx_buf_idx][i] = byte;
+        }
+
+        tx_buf_len[tx_buf_idx] = 64;
+        
+        LATCbits.LATC2 = 1;
+    }
+
+    USBDeluxeDevice_CDC_ACM_TryRx();
+    USBDeluxeDevice_CDC_ACM_DoTx();
+}
+
+
+#endif //USB_USE_CDC
+
+/** EOF cdc.c ****************************************************************/
