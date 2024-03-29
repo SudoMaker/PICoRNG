@@ -14,7 +14,7 @@ With this device, you no longer need to depend on these black boxes in your CPU 
 - Unique anti-tamper measures
 - Board schematics and all software are all open sourced
 
-[Buy it on Tindie](https://www.tindie.com/products/sudomaker/picorng-random-number-generator/)
+**You can read more about how it works & buy it in our [Official Shop](https://shop.sudomaker.com/products/picorng-random-number-generator).**
 
 ## Hardware
 The schematic and gerber files are in the `Hardware` directory.
